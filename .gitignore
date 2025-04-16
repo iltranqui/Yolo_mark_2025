@@ -4,3 +4,45 @@
 /Makefile
 /cmake_install.cmake
 /yolo_mark
+*.txt
+
+# DLL files
+*.dll
+
+# Visual Studio files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Visual Studio build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio cache files
+*.[Cc]ache
+!*.[Cc]ache/
+
+# Visual Studio IntelliSense
+*.VC.db
+*.VC.VC.opendb
+*.VC.opendb
+ipch/
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb

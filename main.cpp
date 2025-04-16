@@ -1,167 +1,227 @@
-#include <cstdio>
-#include <iostream>
-#include <vector>
-#include <numeric>
-#include <chrono>
-#include <atomic>
-#include <locale>
-#include <future>	// C++11: async(); feature<>;
-#include <iostream>
-#include <iomanip>
-#include <fstream>  // std::ofstream
-#include <algorithm> // std::unique
+/*
+ * Yolo_mark - GUI application for marking bounded boxes of objects in images for training Yolo v3 and v2
+ * This tool helps to create annotation files for training neural networks like YOLO
+ */
 
-#include <opencv2/opencv.hpp>			// C++
-#include <opencv2/core/version.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/highgui/highgui.hpp>
-//#include <opencv2/optflow.hpp>
-#include <opencv2/video/tracking.hpp>
+//---------- Standard C++ Libraries ----------
+#include <cstdio>        // Standard input/output functions
+#include <iostream>      // Input/output stream operations
+#include <vector>        // Dynamic array container
+#include <numeric>       // Numeric operations on ranges
+#include <chrono>        // Time-related functionality
+#include <atomic>        // Atomic operations for thread safety
+#include <locale>        // Localization utilities
+#include <future>        // C++11: async(); feature<>; - Asynchronous operations
+#include <iomanip>       // I/O manipulators for formatting
+#include <fstream>       // File stream operations
+#include <algorithm>     // Algorithms for ranges (sorting, searching, etc.)
 
+//---------- OpenCV Libraries ----------
+#include <opencv2/opencv.hpp>            // Main OpenCV header
+#include <opencv2/core/version.hpp>      // OpenCV version information
+#include <opencv2/imgproc/imgproc.hpp>   // Image processing functions
+#include <opencv2/highgui/highgui.hpp>   // GUI functions and window handling
+//#include <opencv2/optflow.hpp>         // Optical flow (commented out)
+#include <opencv2/video/tracking.hpp>    // Object tracking functionality
+
+//---------- Library Configuration for OpenCV ----------
 #ifdef _DEBUG
-#define LIB_SUFFIX "d.lib"
+#define LIB_SUFFIX "d.lib"  // Debug library suffix
 #else
-#define LIB_SUFFIX ".lib"
+#define LIB_SUFFIX ".lib"   // Release library suffix
 #endif // DEBUG
 
-#ifndef CV_VERSION_EPOCH
-#include "opencv2/videoio/videoio.hpp"
+// OpenCV version-specific configuration
+#ifndef CV_VERSION_EPOCH   // OpenCV 3.x and 4.x
+#include "opencv2/videoio/videoio.hpp"  // Video I/O functionality
 #define OPENCV_VERSION CVAUX_STR(CV_VERSION_MAJOR)"" CVAUX_STR(CV_VERSION_MINOR)"" CVAUX_STR(CV_VERSION_REVISION)
-#pragma comment(lib, "opencv_world" OPENCV_VERSION LIB_SUFFIX)
-#else
+#pragma comment(lib, "opencv_world4.lib")  // Link with the unified OpenCV 4.x library
+#else                      // OpenCV 2.x
 #define OPENCV_VERSION CVAUX_STR(CV_VERSION_EPOCH)"" CVAUX_STR(CV_VERSION_MAJOR)"" CVAUX_STR(CV_VERSION_MINOR)
+// Link with individual OpenCV 2.x libraries
 #pragma comment(lib, "opencv_core" OPENCV_VERSION LIB_SUFFIX)
 #pragma comment(lib, "opencv_imgproc" OPENCV_VERSION LIB_SUFFIX)
 #pragma comment(lib, "opencv_highgui" OPENCV_VERSION LIB_SUFFIX)
 #endif
 
+// Compatibility definition for CV_FILLED constant
 #ifndef CV_FILLED
 #define CV_FILLED cv::FILLED
 #endif
 
 
-using namespace cv;
+using namespace cv;  // Use OpenCV namespace for convenience
 
+//---------- Data Structures ----------
 
-// label coordinates
+// Structure to store bounding box coordinates and object class ID
 struct coord_t {
-    cv::Rect_<float> abs_rect;
-    int id;
+    cv::Rect_<float> abs_rect;  // Rectangle with floating-point coordinates (x, y, width, height)
+    int id;                     // Object class ID corresponding to the label in obj.names file
 };
 
+//---------- Optical Flow Tracking Class ----------
+
+/**
+ * Tracker_optflow - Class for tracking bounding boxes between frames using optical flow
+ * Uses Lucas-Kanade optical flow algorithm to track object positions across frames
+ */
 class Tracker_optflow {
 public:
-    const int flow_error;
+    const int flow_error;  // Maximum allowed error for optical flow tracking
 
+    /**
+     * Constructor - initializes the optical flow tracker
+     * @param win_size Size of the search window at each pyramid level
+     * @param max_level 0-based maximal pyramid level number
+     * @param iterations Unused parameter (legacy)
+     * @param _flow_error Maximum allowed error for optical flow tracking
+     */
     Tracker_optflow(int win_size = 15, int max_level = 3, int iterations = 8000, int _flow_error = -1) :
         flow_error((_flow_error > 0) ? _flow_error : (win_size * 4))
     {
+        // Create and configure the sparse optical flow algorithm
         sync_PyrLKOpticalFlow = cv::SparsePyrLKOpticalFlow::create();
-        sync_PyrLKOpticalFlow->setWinSize(cv::Size(win_size, win_size));    // 9, 15, 21, 31
-        sync_PyrLKOpticalFlow->setMaxLevel(max_level);        // +- 3 pt
-
+        sync_PyrLKOpticalFlow->setWinSize(cv::Size(win_size, win_size));    // Search window size
+        sync_PyrLKOpticalFlow->setMaxLevel(max_level);                      // Maximum pyramid level
     }
 
-    // just to avoid extra allocations
-    cv::Mat dst_grey;
-    cv::Mat prev_pts_flow, cur_pts_flow;
-    cv::Mat status, err;
+    // Image matrices and tracking data
+    cv::Mat dst_grey;                                   // Destination image in grayscale
+    cv::Mat prev_pts_flow, cur_pts_flow;               // Previous and current tracking points
+    cv::Mat status, err;                               // Status and error matrices for tracking
+    cv::Mat src_grey;                                  // Source image in grayscale
+    cv::Ptr<cv::SparsePyrLKOpticalFlow> sync_PyrLKOpticalFlow;  // Optical flow algorithm
 
-    cv::Mat src_grey;    // used in both functions
-    cv::Ptr<cv::SparsePyrLKOpticalFlow> sync_PyrLKOpticalFlow;
+    // Bounding box tracking data
+    std::vector<coord_t> cur_bbox_vec;                 // Current bounding boxes
+    std::vector<bool> good_bbox_vec_flags;             // Flags indicating valid tracking
 
-    std::vector<coord_t> cur_bbox_vec;
-    std::vector<bool> good_bbox_vec_flags;
-
+    /**
+     * Updates the current bounding boxes and prepares tracking points
+     * @param _cur_bbox_vec Vector of bounding boxes to track
+     */
     void update_cur_bbox_vec(std::vector<coord_t> _cur_bbox_vec)
     {
+        // Store the new bounding boxes and initialize tracking flags
         cur_bbox_vec = _cur_bbox_vec;
         good_bbox_vec_flags = std::vector<bool>(cur_bbox_vec.size(), true);
         cv::Mat prev_pts, cur_pts_flow;
 
+        // Extract center points of each bounding box for tracking
         for (auto &i : cur_bbox_vec) {
+            // Calculate center coordinates of the bounding box
             float x_center = (i.abs_rect.x + i.abs_rect.width / 2.0F);
             float y_center = (i.abs_rect.y + i.abs_rect.height / 2.0F);
             prev_pts.push_back(cv::Point2f(x_center, y_center));
         }
 
+        // Prepare points for optical flow tracking
         if (prev_pts.rows == 0)
-            prev_pts_flow = cv::Mat();
+            prev_pts_flow = cv::Mat();  // No points to track
         else
-            cv::transpose(prev_pts, prev_pts_flow);
+            cv::transpose(prev_pts, prev_pts_flow);  // Format points for optical flow algorithm
     }
 
 
+    /**
+     * Updates the source image and bounding boxes for tracking
+     * @param new_src_mat New source image
+     * @param _cur_bbox_vec Vector of bounding boxes to track
+     */
     void update_tracking_flow(cv::Mat new_src_mat, std::vector<coord_t> _cur_bbox_vec)
     {
+        // Convert the source image to grayscale based on its channel count
         if (new_src_mat.channels() == 1) {
+            // Already grayscale
             src_grey = new_src_mat.clone();
         }
         else if (new_src_mat.channels() == 3) {
+            // BGR color image
             cv::cvtColor(new_src_mat, src_grey, cv::COLOR_BGR2GRAY, 1);
         }
         else if (new_src_mat.channels() == 4) {
+            // BGRA color image with alpha channel
             cv::cvtColor(new_src_mat, src_grey, cv::COLOR_BGRA2GRAY, 1);
         }
         else {
+            // Unsupported image format
             std::cerr << " Warning: new_src_mat.channels() is not: 1, 3 or 4. It is = " << new_src_mat.channels() << " \n";
             return;
         }
+
+        // Update bounding boxes for tracking
         update_cur_bbox_vec(_cur_bbox_vec);
     }
 
 
+    /**
+     * Tracks objects from previous frame to current frame using optical flow
+     * @param new_dst_mat New destination image to track objects in
+     * @param check_error Whether to check for tracking errors
+     * @return Vector of tracked bounding boxes
+     */
     std::vector<coord_t> tracking_flow(cv::Mat new_dst_mat, bool check_error = true)
     {
+        // Check if optical flow tracker is initialized
         if (sync_PyrLKOpticalFlow.empty()) {
             std::cout << "sync_PyrLKOpticalFlow isn't initialized \n";
             return cur_bbox_vec;
         }
 
+        // Convert destination image to grayscale
         cv::cvtColor(new_dst_mat, dst_grey, cv::COLOR_BGR2GRAY, 1);
 
+        // Check if source and destination images have the same dimensions
         if (src_grey.rows != dst_grey.rows || src_grey.cols != dst_grey.cols) {
             src_grey = dst_grey.clone();
-            //std::cerr << " Warning: src_grey.rows != dst_grey.rows || src_grey.cols != dst_grey.cols \n";
+            // Return current bounding boxes without tracking if dimensions don't match
             return cur_bbox_vec;
         }
 
+        // Check if there are points to track
         if (prev_pts_flow.cols < 1) {
             return cur_bbox_vec;
         }
 
-        ////sync_PyrLKOpticalFlow_gpu.sparse(src_grey_gpu, dst_grey_gpu, prev_pts_flow_gpu, cur_pts_flow_gpu, status_gpu, &err_gpu);    // OpenCV 2.4.x
-        sync_PyrLKOpticalFlow->calc(src_grey, dst_grey, prev_pts_flow, cur_pts_flow, status, err);    // OpenCV 3.x
+        // Calculate optical flow between source and destination images
+        sync_PyrLKOpticalFlow->calc(src_grey, dst_grey, prev_pts_flow, cur_pts_flow, status, err);
 
+        // Update source image for next tracking iteration
         dst_grey.copyTo(src_grey);
 
+        // Store tracked bounding boxes
         std::vector<coord_t> result_bbox_vec;
 
+        // Process tracking results if dimensions match
         if (err.rows == cur_bbox_vec.size() && status.rows == cur_bbox_vec.size())
         {
             for (size_t i = 0; i < cur_bbox_vec.size(); ++i)
             {
+                // Get current and previous tracking points
                 cv::Point2f cur_key_pt = cur_pts_flow.at<cv::Point2f>(0, i);
                 cv::Point2f prev_key_pt = prev_pts_flow.at<cv::Point2f>(0, i);
 
+                // Calculate movement vector
                 float moved_x = cur_key_pt.x - prev_key_pt.x;
                 float moved_y = cur_key_pt.y - prev_key_pt.y;
 
+                // Check if tracking is valid based on movement and error
                 if (abs(moved_x) < 100 && abs(moved_y) < 100 && good_bbox_vec_flags[i])
                     if (err.at<float>(0, i) < flow_error && status.at<unsigned char>(0, i) != 0 &&
                         ((float)cur_bbox_vec[i].abs_rect.x + moved_x) > 0 && ((float)cur_bbox_vec[i].abs_rect.y + moved_y) > 0)
                     {
-                        cur_bbox_vec[i].abs_rect.x += moved_x;// +0.5;
-                        cur_bbox_vec[i].abs_rect.y += moved_y;// +0.5;
+                        // Update bounding box position
+                        cur_bbox_vec[i].abs_rect.x += moved_x;
+                        cur_bbox_vec[i].abs_rect.y += moved_y;
                         result_bbox_vec.push_back(cur_bbox_vec[i]);
                     }
-                    else good_bbox_vec_flags[i] = false;
-                else good_bbox_vec_flags[i] = false;
-
-                //if(!check_error && !good_bbox_vec_flags[i]) result_bbox_vec.push_back(cur_bbox_vec[i]);
+                    else good_bbox_vec_flags[i] = false;  // Mark tracking as failed
+                else good_bbox_vec_flags[i] = false;      // Mark tracking as failed
             }
         }
 
+        // Update previous points for next tracking iteration
         prev_pts_flow = cur_pts_flow.clone();
 
         return result_bbox_vec;
@@ -169,164 +229,239 @@ public:
 
 };
 
-std::atomic<bool> right_button_click;
-std::atomic<int> move_rect_id;
-std::atomic<bool> move_rect;
-std::atomic<bool> clear_marks;
-std::atomic<bool> copy_previous_marks(false);
-std::atomic<bool> tracker_copy_previous_marks(false);
+//---------- Global Variables for UI Interaction ----------
 
-std::atomic<bool> show_help;
-std::atomic<bool> exit_flag(false);
+// Mouse interaction state variables (thread-safe atomic variables)
+std::atomic<bool> right_button_click;      // Right mouse button is being pressed
+std::atomic<int> move_rect_id;             // ID of the rectangle being moved
+std::atomic<bool> move_rect;               // Rectangle is being moved
+std::atomic<bool> clear_marks;             // Clear all marks from current image
+std::atomic<bool> copy_previous_marks(false);       // Copy marks from previous image
+std::atomic<bool> tracker_copy_previous_marks(false); // Track objects from previous image
 
-std::atomic<int> mark_line_width(2); // default mark line width is 2 pixels.
-const int MAX_MARK_LINE_WIDTH = 3;
-std::atomic<bool> show_mark_class(true);
-std::atomic<bool> delete_selected(false);
+// UI state variables
+std::atomic<bool> show_help;               // Show help text
+std::atomic<bool> exit_flag(false);        // Exit the application
 
-std::atomic<int> x_start, y_start;
-std::atomic<int> x_end, y_end;
-std::atomic<int> x_size, y_size;
-std::atomic<bool> draw_select, selected, undo;
+// Marking appearance settings
+std::atomic<int> mark_line_width(2);       // Width of bounding box lines (default: 2 pixels)
+const int MAX_MARK_LINE_WIDTH = 3;         // Maximum allowed line width
+std::atomic<bool> show_mark_class(true);   // Show class ID and name on bounding boxes
+std::atomic<bool> delete_selected(false);  // Delete the selected bounding box
 
-std::atomic<int> add_id_img;
-Rect prev_img_rect(0, 0, 50, 100);
-Rect next_img_rect(1280 - 50, 0, 50, 100);
+// Selection coordinates and state
+std::atomic<int> x_start, y_start;         // Starting coordinates of selection
+std::atomic<int> x_end, y_end;             // Ending coordinates of selection
+std::atomic<int> x_size, y_size;           // Size of selection rectangle
+std::atomic<bool> draw_select;             // Currently drawing a selection
+std::atomic<bool> selected;                // Selection has been completed
+std::atomic<bool> undo;                    // Undo last action
+
+// Navigation variables
+std::atomic<int> add_id_img;               // Image navigation direction
+Rect prev_img_rect(0, 0, 50, 100);         // Rectangle for previous image button
+Rect next_img_rect(1280 - 50, 0, 50, 100); // Rectangle for next image button
 
 
+/**
+ * Mouse event callback function for handling user interactions
+ * @param event Type of mouse event (click, move, etc.)
+ * @param x X-coordinate of mouse position
+ * @param y Y-coordinate of mouse position
+ * @param flags Additional flags for the event
+ * @param user_data User-provided data (unused)
+ */
 void callback_mouse_click(int event, int x, int y, int flags, void* user_data)
 {
+    // Handle double left-click
     if (event == cv::EVENT_LBUTTONDBLCLK)
     {
         std::cout << "cv::EVENT_LBUTTONDBLCLK \n";
     }
+    // Handle left mouse button press
     else if (event == cv::EVENT_LBUTTONDOWN)
     {
+        // Start drawing selection rectangle
         draw_select = true;
         selected = false;
         x_start = x;
         y_start = y;
 
-        if (prev_img_rect.contains(Point2i(x, y))) add_id_img = -1;
-        else if (next_img_rect.contains(Point2i(x, y))) add_id_img = 1;
-        else add_id_img = 0;
-        //std::cout << "cv::EVENT_LBUTTONDOWN \n";
+        // Check if clicking on navigation buttons
+        if (prev_img_rect.contains(Point2i(x, y)))
+            add_id_img = -1;  // Previous image button
+        else if (next_img_rect.contains(Point2i(x, y)))
+            add_id_img = 1;   // Next image button
+        else
+            add_id_img = 0;   // Not on navigation buttons
     }
+    // Handle left mouse button release
     else if (event == cv::EVENT_LBUTTONUP)
     {
+        // Calculate selection rectangle size
         x_size = abs(x - x_start);
         y_size = abs(y - y_start);
         x_end = max(x, 0);
         y_end = max(y, 0);
+
+        // Complete selection
         draw_select = false;
         selected = true;
-        //std::cout << "cv::EVENT_LBUTTONUP \n";
     }
+    // Handle right mouse button press (for moving bounding boxes)
     else if (event == cv::EVENT_RBUTTONDOWN)
     {
         right_button_click = true;
-
         x_start = x;
         y_start = y;
         std::cout << "cv::EVENT_RBUTTONDOWN \n";
     }
+    // Handle right mouse button release
     else if (event == cv::EVENT_RBUTTONUP)
     {
         right_button_click = false;
-        move_rect = true;
+        move_rect = true;  // Complete the move operation
     }
-    if (event == cv::EVENT_RBUTTONDBLCLK)
+    // Handle right mouse button double-click
+    else if (event == cv::EVENT_RBUTTONDBLCLK)
     {
         std::cout << "cv::EVENT_RBUTTONDBLCLK \n";
     }
+    // Handle mouse movement
     else if (event == cv::EVENT_MOUSEMOVE)
     {
+        // Update current mouse position
         x_end = max(x, 0);
         y_end = max(y, 0);
     }
 }
 
+/**
+ * Custom locale class to ensure decimal points are represented as periods ('.')
+ * This ensures consistent decimal formatting regardless of system locale settings
+ */
 class comma : public std::numpunct<char> {
 public:
 	comma() : std::numpunct<char>() {}
 protected:
+	// Override the decimal point character to always be a period
 	char do_decimal_point() const { return '.';	}
 };
 
 
+/**
+ * Main function - entry point of the application
+ * Handles command-line arguments, loads images and annotations, and runs the marking interface
+ * @param argc Number of command-line arguments
+ * @param argv Array of command-line arguments
+ * @return Exit code (0 for success, non-zero for errors)
+ */
 int main(int argc, char *argv[])
 {
-
 	try
 	{
+		// Set locale to ensure consistent decimal point formatting
 		std::locale loccomma(std::locale::classic(), new comma);
 		std::locale::global(loccomma);
 
+		// Default path for images
 		std::string images_path = "./";
 
+		// Parse command line arguments
 		if (argc >= 2) {
-			images_path = std::string(argv[1]);         // path to images, train and synset
+			images_path = std::string(argv[1]);         // Path to images directory
 		}
 		else {
+			// Show usage information if no arguments provided
 			std::cout << "Usage: [path_to_images] [train.txt] [obj.names] \n";
 			return 0;
 		}
 
-		std::string train_filename = images_path + "train.txt";
-		std::string synset_filename = images_path + "obj.names";
+		// Set default filenames based on images path
+		std::string train_filename = images_path + "train.txt";  // File to store list of training images
+		std::string synset_filename = images_path + "obj.names"; // File containing object class names
 
+		// Override default filenames if provided in command line
 		if (argc >= 3) {
-			train_filename = std::string(argv[2]);		// file containing: list of images
+			train_filename = std::string(argv[2]);      // Custom train.txt path
 		}
 
 		if (argc >= 4) {
-			synset_filename = std::string(argv[3]);		// file containing: object names
+			synset_filename = std::string(argv[3]);      // Custom obj.names path
 		}
 
-        // optical flow tracker
+        // Initialize optical flow tracker for tracking objects between frames
         Tracker_optflow tracker_optflow;
-        cv::Mat optflow_img;
+        cv::Mat optflow_img;  // Image used for optical flow tracking
 
-		// capture frames from video file - 1 frame per 3 seconds of video
+		// Special mode: Capture frames from video file
+		// This mode is activated when train_filename is "cap_video" or "cap_video_backward"
+		// It extracts frames from a video file at regular intervals
 		if (argc >= 4 && (train_filename == "cap_video" || train_filename == "cap_video_backward")) {
+			// Use the synset_filename as the video file path
 			const std::string videofile = synset_filename;
+
+			// Open the video file
 			cv::VideoCapture cap(videofile);
-#ifndef CV_VERSION_EPOCH    // OpenCV 3.x
+				// Get frames per second based on OpenCV version
+#ifndef CV_VERSION_EPOCH    // OpenCV 3.x and 4.x
             const int fps = cap.get(cv::CAP_PROP_FPS);
 #else                        // OpenCV 2.x
             const int fps = cap.get(CV_CAP_PROP_FPS);
 #endif
+            // Initialize counters for frame extraction
             int frame_counter = 0, image_counter = 0;
+
+            // Check if we're extracting frames in reverse order
             int backward = (train_filename == "cap_video_backward") ? 1 : 0;
-            if (backward) image_counter = 99999999; // 99M
+            if (backward) image_counter = 99999999; // Start from a high number and count down
+			// Set frame extraction interval (default: every 50 frames)
 			float save_each_frames = 50;
+
+			// Override interval if provided as 5th argument
 			if (argc >= 5) save_each_frames = std::stoul(std::string(argv[4]));
 
+			// Extract filename from path (handling both Windows and Unix-style paths)
 			int pos_filename = 0;
-			if ((1 + videofile.find_last_of("\\")) < videofile.length()) pos_filename = 1 + videofile.find_last_of("\\");
-			if ((1 + videofile.find_last_of("/")) < videofile.length()) pos_filename = std::max(pos_filename, 1 + (int)videofile.find_last_of("/"));
+			if ((1 + videofile.find_last_of("\\")) < videofile.length()) pos_filename = 1 + videofile.find_last_of("\\"); // Windows path
+			if ((1 + videofile.find_last_of("/")) < videofile.length()) pos_filename = std::max(pos_filename, 1 + (int)videofile.find_last_of("/")); // Unix path
+
+			// Get filename and filename without extension
 			std::string const filename = videofile.substr(pos_filename);
 			std::string const filename_without_ext = filename.substr(0, filename.find_last_of("."));
 
+			// Process video frames
 			for (cv::Mat frame; cap >> frame, cap.isOpened() && !frame.empty();) {
 				cv::imshow("video cap to frames", frame);
+					// Wait for key press with OpenCV version-specific handling
 #ifndef CV_VERSION_EPOCH
-				int pressed_key = cv::waitKeyEx(20);	// OpenCV 3.x
+				int pressed_key = cv::waitKeyEx(20);	// OpenCV 3.x and 4.x
 #else
 				int pressed_key = cv::waitKey(20);		// OpenCV 2.x
 #endif
+				// Exit on ESC key press (handles different key codes across OpenCV versions)
 				if (pressed_key == 27 || pressed_key == 1048603) break;  // ESC - exit (OpenCV 2.x / 3.x)
-				if (frame_counter++ >= save_each_frames) {		// save frame for each 3 second
+				// Save frame when counter reaches threshold
+				if (frame_counter++ >= save_each_frames) {
+					// Reset counter
 					frame_counter = 0;
+
+					// Format image counter with leading zeros
                     std::stringstream image_counter_ss;
                     image_counter_ss << std::setw(8) << std::setfill('0') << image_counter;
+
+                    // Update counter based on direction (forward or backward)
                     if (backward) image_counter--;
                     else image_counter++;
+					// Create output filename
 					std::string img_name = images_path + "/" + filename_without_ext + "_" + image_counter_ss.str() + ".jpg";
 					std::cout << "saved " << img_name << std::endl;
+
+					// Save frame as image
 					cv::imwrite(img_name, frame);
 				}
 			}
+			// Exit after processing video
 			exit(0);
 		}
 
@@ -336,7 +471,7 @@ int main(int argc, char *argv[])
 		cv::String images_path_cv = images_path;
 		std::vector<cv::String> filenames_in_folder_cv;
 		glob(images_path_cv, filenames_in_folder_cv); // void glob(String pattern, std::vector<String>& result, bool recursive = false);
-		for (auto &i : filenames_in_folder_cv) 
+		for (auto &i : filenames_in_folder_cv)
 			filenames_in_folder.push_back(i);
 
 		std::vector<std::string> jpg_filenames_path;
@@ -359,10 +494,10 @@ int main(int argc, char *argv[])
 			std::string const ext = i.substr(i.find_last_of(".") + 1);
 			std::string const filename_without_ext = filename.substr(0, filename.find_last_of("."));
 
-			if (ext == "jpg" || ext == "JPG" || 
+			if (ext == "jpg" || ext == "JPG" ||
 				ext == "jpeg" || ext == "JPEG" ||
 				ext == "bmp" || ext == "BMP" ||
-				ext == "png" || ext == "PNG" || 
+				ext == "png" || ext == "PNG" ||
 				ext == "ppm" || ext == "PPM")
 			{
 				jpg_filenames_without_ext.push_back(filename_without_ext);
@@ -389,7 +524,7 @@ int main(int argc, char *argv[])
 			std::sort(sorted_names_without_ext.begin(), sorted_names_without_ext.end());
 			for (size_t i = 1; i < sorted_names_without_ext.size(); ++i) {
 				if (sorted_names_without_ext[i - 1] == sorted_names_without_ext[i]) {
-					std::cout << "Error: Can't create " << sorted_names_without_ext[i] << 
+					std::cout << "Error: Can't create " << sorted_names_without_ext[i] <<
 						".txt file for several images with different extensions but with the same filename: "
 						<< sorted_names_without_ext[i] << std::endl;
 					// print duplicate images
@@ -413,7 +548,7 @@ int main(int argc, char *argv[])
 			txt_filenames.begin(), txt_filenames.end(),
 			difference_filenames.begin());
 		difference_filenames.resize(dif_it_end - difference_filenames.begin());
-				
+
 		auto inter_it_end = std::set_intersection(jpg_filenames_without_ext.begin(), jpg_filenames_without_ext.end(),
 			txt_filenames.begin(), txt_filenames.end(),
 			intersect_filenames.begin());
@@ -541,7 +676,7 @@ int main(int argc, char *argv[])
 								relative_center_x << " " << relative_center_y << " " <<
 								relative_width << " " << relative_height << std::endl;
 						}
-						
+
 						// store [path/image name.jpg] to train.txt
 						auto it = std::find(difference_filenames.begin(), difference_filenames.end(), filename_without_ext);
 						if (it != difference_filenames.end())
@@ -561,7 +696,7 @@ int main(int argc, char *argv[])
 				for (size_t i = 0; i < preview_number && (i + trackbar_value) < jpg_filenames_path.size(); ++i)
 				{
 					Mat img = imread(jpg_filenames_path[trackbar_value + i]);
-					// check if the image has been loaded successful to prevent crash 
+					// check if the image has been loaded successful to prevent crash
 					if (img.cols == 0)
 					{
 						continue;
@@ -600,7 +735,7 @@ int main(int argc, char *argv[])
 								coord.id = -1;
 								ss >> coord.id;
 								if (coord.id < 0) continue;
-								float relative_coord[4] = { -1, -1, -1, -1 };  // rel_center_x, rel_center_y, rel_width, rel_height                          
+								float relative_coord[4] = { -1, -1, -1, -1 };  // rel_center_x, rel_center_y, rel_width, rel_height
 								for (size_t i = 0; i < 4; i++) if(!(ss >> relative_coord[i])) continue;
 								for (size_t i = 0; i < 4; i++) if (relative_coord[i] < 0) continue;
 								coord.abs_rect.x = (relative_coord[0] - relative_coord[2] / 2) * (float)full_image_roi.cols;
@@ -625,7 +760,7 @@ int main(int argc, char *argv[])
 						line(dst_roi, Point2i(80, 88), Point2i(85, 93), Scalar(50, 200, 100), 2);
 						line(dst_roi, Point2i(85, 93), Point2i(93, 85), Scalar(50, 200, 100), 2);
 					}
-                    
+
 				}
 				std::cout << " trackbar_value = " << trackbar_value << std::endl;
 
@@ -824,7 +959,7 @@ int main(int argc, char *argv[])
 
 				rectangle(full_image_roi, i.abs_rect, color_rect, mark_line_width);
 			}
-            
+
             // remove selected rect
             if (delete_selected) {
                 delete_selected = false;
@@ -920,7 +1055,7 @@ int main(int argc, char *argv[])
 
 			if (pressed_key >= 0)
 				for (int i = 0; i < 5; ++i) cv::waitKey(1);
-			
+
 			if (exit_flag) break;	// exit after saving
 			if (pressed_key == 27 || pressed_key == 1048603) exit_flag = true;// break;  // ESC - save & exit
 
